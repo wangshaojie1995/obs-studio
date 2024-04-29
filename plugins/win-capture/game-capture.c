@@ -12,10 +12,12 @@
 #include <ipc-util/pipe.h>
 #include <util/windows/obfuscate.h>
 #include "inject-library.h"
+#include "compat-helpers.h"
 #include "graphics-hook-info.h"
 #include "graphics-hook-ver.h"
 #include "cursor-capture.h"
 #include "app-helpers.h"
+#include "audio-helpers.h"
 #include "nt-stuff.h"
 
 #define do_log(level, format, ...)                  \
@@ -30,16 +32,17 @@
 
 #define SETTING_MODE                 "capture_mode"
 #define SETTING_CAPTURE_WINDOW       "window"
-#define SETTING_ACTIVE_WINDOW        "active_window"
 #define SETTING_WINDOW_PRIORITY      "priority"
 #define SETTING_COMPATIBILITY        "sli_compatibility"
 #define SETTING_CURSOR               "capture_cursor"
 #define SETTING_TRANSPARENCY         "allow_transparency"
+#define SETTING_PREMULTIPLIED_ALPHA  "premultiplied_alpha"
 #define SETTING_LIMIT_FRAMERATE      "limit_framerate"
 #define SETTING_CAPTURE_OVERLAYS     "capture_overlays"
 #define SETTING_ANTI_CHEAT_HOOK      "anti_cheat_hook"
 #define SETTING_HOOK_RATE            "hook_rate"
 #define SETTING_RGBA10A2_SPACE       "rgb10a2_space"
+#define SETTINGS_COMPAT_INFO         "compat_info"
 
 /* deprecated */
 #define SETTING_ANY_FULLSCREEN   "capture_any_fullscreen"
@@ -56,6 +59,7 @@
 #define TEXT_ANY_FULLSCREEN        obs_module_text("GameCapture.AnyFullscreen")
 #define TEXT_SLI_COMPATIBILITY     obs_module_text("SLIFix")
 #define TEXT_ALLOW_TRANSPARENCY    obs_module_text("AllowTransparency")
+#define TEXT_PREMULTIPLIED_ALPHA   obs_module_text("PremultipliedAlpha")
 #define TEXT_WINDOW                obs_module_text("WindowCapture.Window")
 #define TEXT_MATCH_PRIORITY        obs_module_text("WindowCapture.Priority")
 #define TEXT_MATCH_TITLE           obs_module_text("WindowCapture.Priority.Title")
@@ -111,11 +115,13 @@ struct game_capture_config {
 	bool cursor;
 	bool force_shmem;
 	bool allow_transparency;
+	bool premultiplied_alpha;
 	bool limit_framerate;
 	bool capture_overlays;
 	bool anticheat_hook;
 	enum hook_rate hook_rate;
 	bool is_10a2_2100pq;
+	bool capture_audio;
 };
 
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(
@@ -125,6 +131,7 @@ typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetWindowDpiAwarenessContext)(HWND);
 
 struct game_capture {
 	obs_source_t *source;
+	obs_source_t *audio_source;
 
 	struct cursor_data cursor_data;
 	HANDLE injector_process;
@@ -365,6 +372,20 @@ static void stop_capture(struct game_capture *gc)
 	if (gc->active)
 		info("capture stopped");
 
+	// if it was previously capturing, send an unhooked signal
+	if (gc->capturing) {
+		signal_handler_t *sh =
+			obs_source_get_signal_handler(gc->source);
+		calldata_t data = {0};
+		calldata_set_ptr(&data, "source", gc->source);
+		signal_handler_signal(sh, "unhooked", &data);
+		calldata_free(&data);
+
+		// Also update audio source to stop capturing
+		if (gc->audio_source)
+			reconfigure_audio_source(gc->audio_source, NULL);
+	}
+
 	gc->copy_texture = NULL;
 	gc->wait_for_target_startup = false;
 	gc->active = false;
@@ -386,6 +407,13 @@ static void game_capture_destroy(void *data)
 {
 	struct game_capture *gc = data;
 	stop_capture(gc);
+
+	if (gc->audio_source)
+		destroy_audio_source(gc->source, &gc->audio_source);
+
+	signal_handler_t *sh = obs_source_get_signal_handler(gc->source);
+	signal_handler_disconnect(sh, "rename", rename_audio_source,
+				  &gc->audio_source);
 
 	if (gc->hotkey_pair)
 		obs_hotkey_pair_unregister(gc->hotkey_pair);
@@ -435,6 +463,8 @@ static inline void get_config(struct game_capture_config *cfg,
 	cfg->cursor = obs_data_get_bool(settings, SETTING_CURSOR);
 	cfg->allow_transparency =
 		obs_data_get_bool(settings, SETTING_TRANSPARENCY);
+	cfg->premultiplied_alpha =
+		obs_data_get_bool(settings, SETTING_PREMULTIPLIED_ALPHA);
 	cfg->limit_framerate =
 		obs_data_get_bool(settings, SETTING_LIMIT_FRAMERATE);
 	cfg->capture_overlays =
@@ -446,6 +476,7 @@ static inline void get_config(struct game_capture_config *cfg,
 	cfg->is_10a2_2100pq =
 		strcmp(obs_data_get_string(settings, SETTING_RGBA10A2_SPACE),
 		       "2100pq") == 0;
+	cfg->capture_audio = obs_data_get_bool(settings, SETTING_CAPTURE_AUDIO);
 }
 
 static inline int s_cmp(const char *str1, const char *str2)
@@ -517,6 +548,25 @@ static bool hotkey_stop(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey,
 	return true;
 }
 
+static void game_capture_get_hooked(void *data, calldata_t *cd)
+{
+	struct game_capture *gc = data;
+	if (!gc)
+		return;
+
+	calldata_set_bool(cd, "hooked", gc->capturing);
+
+	if (gc->capturing) {
+		calldata_set_string(cd, "title", gc->title.array);
+		calldata_set_string(cd, "class", gc->class.array);
+		calldata_set_string(cd, "executable", gc->executable.array);
+	} else {
+		calldata_set_string(cd, "title", "");
+		calldata_set_string(cd, "class", "");
+		calldata_set_string(cd, "executable", "");
+	}
+}
+
 static void game_capture_update(void *data, obs_data_t *settings)
 {
 	struct game_capture *gc = data;
@@ -562,6 +612,11 @@ static void game_capture_update(void *data, obs_data_t *settings)
 	} else {
 		gc->initial_config = false;
 	}
+
+	/* Linked audio capture source stuff */
+	setup_audio_source(gc->source, &gc->audio_source,
+			   cfg.mode == CAPTURE_MODE_WINDOW ? window : NULL,
+			   cfg.capture_audio, cfg.priority);
 }
 
 extern void wait_for_hook_initialization(void);
@@ -608,6 +663,21 @@ static void *game_capture_create(obs_data_t *settings, obs_source_t *source)
 				get_window_dpi_awareness_context;
 		}
 	}
+
+	signal_handler_t *sh = obs_source_get_signal_handler(source);
+	signal_handler_add(sh, "void unhooked(ptr source)");
+	signal_handler_add(
+		sh,
+		"void hooked(ptr source, string title, string class, string executable)");
+
+	proc_handler_t *ph = obs_source_get_proc_handler(source);
+	proc_handler_add(
+		ph,
+		"void get_hooked(out bool hooked, out string title, out string class, out string executable)",
+		game_capture_get_hooked, gc);
+
+	signal_handler_connect(sh, "rename", rename_audio_source,
+			       &gc->audio_source);
 
 	game_capture_update(gc, settings);
 	return gc;
@@ -1324,9 +1394,6 @@ static inline enum capture_result init_capture_data(struct game_capture *gc)
 	return CAPTURE_SUCCESS;
 }
 
-#define PIXEL_16BIT_SIZE 2
-#define PIXEL_32BIT_SIZE 4
-
 static inline uint32_t convert_5_to_8bit(uint16_t val)
 {
 	return (uint32_t)((double)(val & 0x1F) * (255.0 / 31.0));
@@ -1852,6 +1919,31 @@ static void game_capture_tick(void *data, float seconds)
 		else
 			debug("init_capture_data failed");
 
+		// If capture was successful, send a hooked signal
+		if (gc->capturing) {
+			if (gc->config.mode == CAPTURE_MODE_ANY) {
+				ms_get_window_exe(&gc->executable, gc->window);
+				ms_get_window_title(&gc->title, gc->window);
+				ms_get_window_class(&gc->class, gc->window);
+			}
+			signal_handler_t *sh =
+				obs_source_get_signal_handler(gc->source);
+			calldata_t data = {0};
+
+			calldata_set_ptr(&data, "source", gc->source);
+			calldata_set_string(&data, "title", gc->title.array);
+			calldata_set_string(&data, "class", gc->class.array);
+			calldata_set_string(&data, "executable",
+					    gc->executable.array);
+
+			signal_handler_signal(sh, "hooked", &data);
+			calldata_free(&data);
+
+			if (gc->audio_source) {
+				reconfigure_audio_source(gc->audio_source,
+							 gc->window);
+			}
+		}
 		if (result != CAPTURE_RETRY && !gc->capturing) {
 			gc->retry_interval =
 				ERROR_RETRY_INTERVAL *
@@ -2153,7 +2245,13 @@ static void game_capture_render(void *data, gs_effect_t *unused)
 	while (gs_effect_loop(effect, tech_name)) {
 		const bool previous = gs_framebuffer_srgb_enabled();
 		gs_enable_framebuffer_srgb(allow_transparency || linear_sample);
+		gs_blend_state_push();
 		gs_enable_blending(allow_transparency);
+		gs_blend_function_separate(gc->config.premultiplied_alpha
+						   ? GS_BLEND_ONE
+						   : GS_BLEND_SRCALPHA,
+					   GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
+					   GS_BLEND_INVSRCALPHA);
 		if (linear_sample)
 			gs_effect_set_texture_srgb(image, texture);
 		else
@@ -2162,7 +2260,7 @@ static void game_capture_render(void *data, gs_effect_t *unused)
 								"multiplier"),
 				    multiplier);
 		gs_draw_sprite(texture, flip, 0, 0);
-		gs_enable_blending(true);
+		gs_blend_state_pop();
 		gs_enable_framebuffer_srgb(previous);
 	}
 
@@ -2217,6 +2315,7 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, SETTING_COMPATIBILITY, false);
 	obs_data_set_default_bool(settings, SETTING_CURSOR, true);
 	obs_data_set_default_bool(settings, SETTING_TRANSPARENCY, false);
+	obs_data_set_default_bool(settings, SETTING_PREMULTIPLIED_ALPHA, false);
 	obs_data_set_default_bool(settings, SETTING_LIMIT_FRAMERATE, false);
 	obs_data_set_default_bool(settings, SETTING_CAPTURE_OVERLAYS, false);
 	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, true);
@@ -2251,8 +2350,50 @@ static bool mode_callback(obs_properties_t *ppts, obs_property_t *p,
 static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
 				    obs_data_t *settings)
 {
-	return ms_check_window_property_setting(ppts, p, settings,
-						SETTING_CAPTURE_WINDOW, 1);
+	bool modified = ms_check_window_property_setting(
+		ppts, p, settings, SETTING_CAPTURE_WINDOW, 1);
+
+	bool capture_any;
+	if (using_older_non_mode_format(settings)) {
+		capture_any =
+			obs_data_get_bool(settings, SETTING_ANY_FULLSCREEN);
+	} else {
+		const char *mode = obs_data_get_string(settings, SETTING_MODE);
+		capture_any = strcmp(mode, SETTING_MODE_ANY) == 0 ||
+			      strcmp(mode, SETTING_MODE_HOTKEY) == 0;
+	}
+
+	if (capture_any)
+		return modified;
+
+	const char *window =
+		obs_data_get_string(settings, SETTING_CAPTURE_WINDOW);
+
+	char *class;
+	char *exe;
+	char *title;
+	ms_build_window_strings(window, &class, &title, &exe);
+	struct compat_result *compat =
+		check_compatibility(title, class, exe, GAME_CAPTURE);
+	bfree(title);
+	bfree(exe);
+	bfree(class);
+
+	obs_property_t *p_warn = obs_properties_get(ppts, SETTINGS_COMPAT_INFO);
+
+	if (!compat) {
+		modified = obs_property_visible(p_warn) || modified;
+		obs_property_set_visible(p_warn, false);
+		return modified;
+	}
+
+	obs_property_set_long_description(p_warn, compat->message);
+	obs_property_text_set_info_type(p_warn, compat->severity);
+	obs_property_set_visible(p_warn, true);
+
+	compat_result_free(compat);
+
+	return true;
 }
 
 static BOOL CALLBACK EnumFirstMonitor(HMONITOR monitor, HDC hdc, LPRECT rc,
@@ -2337,11 +2478,24 @@ static obs_properties_t *game_capture_properties(void *data)
 	obs_property_list_add_int(p, TEXT_MATCH_CLASS, WINDOW_PRIORITY_CLASS);
 	obs_property_list_add_int(p, TEXT_MATCH_EXE, WINDOW_PRIORITY_EXE);
 
+	p = obs_properties_add_text(ppts, SETTINGS_COMPAT_INFO, NULL,
+				    OBS_TEXT_INFO);
+	obs_property_set_enabled(p, false);
+
+	if (audio_capture_available()) {
+		p = obs_properties_add_bool(ppts, SETTING_CAPTURE_AUDIO,
+					    TEXT_CAPTURE_AUDIO);
+		obs_property_set_long_description(p, TEXT_CAPTURE_AUDIO_TT);
+	}
+
 	obs_properties_add_bool(ppts, SETTING_COMPATIBILITY,
 				TEXT_SLI_COMPATIBILITY);
 
 	obs_properties_add_bool(ppts, SETTING_TRANSPARENCY,
 				TEXT_ALLOW_TRANSPARENCY);
+
+	obs_properties_add_bool(ppts, SETTING_PREMULTIPLIED_ALPHA,
+				TEXT_PREMULTIPLIED_ALPHA);
 
 	obs_properties_add_bool(ppts, SETTING_LIMIT_FRAMERATE,
 				TEXT_LIMIT_FRAMERATE);
@@ -2411,11 +2565,20 @@ game_capture_get_color_space(void *data, size_t count,
 	return space;
 }
 
+static void game_capture_enum(void *data, obs_source_enum_proc_t cb,
+			      void *param)
+{
+	struct game_capture *gc = data;
+	if (gc->audio_source)
+		cb(gc->source, gc->audio_source, param);
+}
+
 struct obs_source_info game_capture_info = {
 	.id = "game_capture",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW |
-			OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_SRGB,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_SRGB,
 	.get_name = game_capture_name,
 	.create = game_capture_create,
 	.destroy = game_capture_destroy,
@@ -2423,6 +2586,7 @@ struct obs_source_info game_capture_info = {
 	.get_height = game_capture_height,
 	.get_defaults = game_capture_defaults,
 	.get_properties = game_capture_properties,
+	.enum_active_sources = game_capture_enum,
 	.update = game_capture_update,
 	.video_tick = game_capture_tick,
 	.video_render = game_capture_render,

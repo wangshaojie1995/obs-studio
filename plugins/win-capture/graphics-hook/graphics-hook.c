@@ -2,8 +2,13 @@
 #include <psapi.h>
 #include <inttypes.h>
 #include "graphics-hook.h"
+#ifdef OBS_LEGACY
 #include "../graphics-hook-ver.h"
 #include "../../libobs/util/windows/obfuscate.h"
+#else
+#include <graphics-hook-ver.h>
+#include <util/windows/obfuscate.h>
+#endif
 
 #define DEBUG_OUTPUT
 
@@ -243,8 +248,6 @@ static inline bool init_hook(HANDLE thread_handle)
 
 	_snwprintf(keepalive_name, sizeof(keepalive_name) / sizeof(wchar_t),
 		   L"%s%lu", WINDOW_HOOK_KEEPALIVE, GetCurrentProcessId());
-
-	init_pipe();
 
 	init_dummy_window_thread();
 	log_current_process();

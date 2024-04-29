@@ -1,5 +1,5 @@
 /******************************************************************************
-    Copyright (C) 2013 by Hugh Bailey <obs.jim@gmail.com>
+    Copyright (C) 2023 by Lain Bailey <lain@obsproject.com>
                           Philippe Groarke <philippe.groarke@gmail.com>
 
     This program is free software: you can redistribute it and/or modify
@@ -24,11 +24,11 @@
 #include <memory>
 #include <string>
 
-#include <libff/ff-util.h>
-
 #include <obs.hpp>
 
 #include "auth-base.hpp"
+#include "ffmpeg-utils.hpp"
+#include "obs-app-theming.hpp"
 
 class OBSBasic;
 class QAbstractButton;
@@ -36,6 +36,7 @@ class QRadioButton;
 class QComboBox;
 class QCheckBox;
 class QLabel;
+class QButtonGroup;
 class OBSPropertiesView;
 class OBSHotkeyWidget;
 
@@ -69,24 +70,12 @@ public slots:
 	}
 };
 
-class OBSFFDeleter {
-public:
-	void operator()(const ff_format_desc *format)
-	{
-		ff_format_desc_free(format);
-	}
-	void operator()(const ff_codec_desc *codec)
-	{
-		ff_codec_desc_free(codec);
-	}
-};
-using OBSFFCodecDesc = std::unique_ptr<const ff_codec_desc, OBSFFDeleter>;
-using OBSFFFormatDesc = std::unique_ptr<const ff_format_desc, OBSFFDeleter>;
-
 class OBSBasicSettings : public QDialog {
 	Q_OBJECT
 	Q_PROPERTY(QIcon generalIcon READ GetGeneralIcon WRITE SetGeneralIcon
 			   DESIGNABLE true)
+	Q_PROPERTY(QIcon appearanceIcon READ GetAppearanceIcon WRITE
+			   SetAppearanceIcon DESIGNABLE true)
 	Q_PROPERTY(QIcon streamIcon READ GetStreamIcon WRITE SetStreamIcon
 			   DESIGNABLE true)
 	Q_PROPERTY(QIcon outputIcon READ GetOutputIcon WRITE SetOutputIcon
@@ -102,6 +91,19 @@ class OBSBasicSettings : public QDialog {
 	Q_PROPERTY(QIcon advancedIcon READ GetAdvancedIcon WRITE SetAdvancedIcon
 			   DESIGNABLE true)
 
+	enum Pages {
+		GENERAL,
+		APPEARANCE,
+		STREAM,
+		OUTPUT,
+		AUDIO,
+		VIDEO,
+		HOTKEYS,
+		ACCESSIBILITY,
+		ADVANCED,
+		NUM_PAGES
+	};
+
 private:
 	OBSBasic *main;
 
@@ -116,15 +118,16 @@ private:
 	bool videoChanged = false;
 	bool hotkeysChanged = false;
 	bool a11yChanged = false;
+	bool appearanceChanged = false;
 	bool advancedChanged = false;
 	int pageIndex = 0;
 	bool loading = true;
 	bool forceAuthReload = false;
 	bool forceUpdateCheck = false;
-	std::string savedTheme;
 	int sampleRateIndex = 0;
 	int channelIndex = 0;
 	bool llBufferingEnabled = false;
+	bool hotkeysLoaded = false;
 
 	int lastSimpleRecQualityIdx = 0;
 	int lastServiceIdx = -1;
@@ -134,7 +137,9 @@ private:
 	static constexpr uint32_t ENCODER_HIDE_FLAGS =
 		(OBS_ENCODER_CAP_DEPRECATED | OBS_ENCODER_CAP_INTERNAL);
 
-	OBSFFFormatDesc formats;
+	OBSTheme *savedTheme = nullptr;
+
+	std::vector<FFmpegFormat> formats;
 
 	OBSPropertiesView *streamProperties = nullptr;
 	OBSPropertiesView *streamEncoderProps = nullptr;
@@ -182,6 +187,8 @@ private:
 			   const char *value);
 	void SaveCheckBox(QAbstractButton *widget, const char *section,
 			  const char *value, bool invert = false);
+	void SaveGroupBox(QGroupBox *widget, const char *section,
+			  const char *value);
 	void SaveEdit(QLineEdit *widget, const char *section,
 		      const char *value);
 	void SaveSpinBox(QSpinBox *widget, const char *section,
@@ -197,9 +204,9 @@ private:
 
 	inline bool Changed() const
 	{
-		return generalChanged || outputsChanged || stream1Changed ||
-		       audioChanged || videoChanged || advancedChanged ||
-		       hotkeysChanged || a11yChanged;
+		return generalChanged || appearanceChanged || outputsChanged ||
+		       stream1Changed || audioChanged || videoChanged ||
+		       advancedChanged || hotkeysChanged || a11yChanged;
 	}
 
 	inline void EnableApplyButton(bool en)
@@ -217,19 +224,29 @@ private:
 		hotkeysChanged = false;
 		a11yChanged = false;
 		advancedChanged = false;
+		appearanceChanged = false;
 		EnableApplyButton(false);
 	}
 
-	void HookWidget(QWidget *widget, const char *signal, const char *slot);
+	template<typename Widget, typename WidgetParent, typename... SignalArgs,
+		 typename... SlotArgs>
+	void HookWidget(Widget *widget,
+			void (WidgetParent::*signal)(SignalArgs...),
+			void (OBSBasicSettings::*slot)(SlotArgs...))
+	{
+		QObject::connect(widget, signal, this, slot);
+		widget->setProperty("changed", QVariant(false));
+	}
 
 	bool QueryChanges();
+	bool QueryAllowedToClose();
 
 	void ResetEncoders(bool streamOnly = false);
 	void LoadColorRanges();
 	void LoadColorSpaces();
 	void LoadColorFormats();
 	void LoadFormats();
-	void ReloadCodecs(const ff_format_desc *formatDesc);
+	void ReloadCodecs(const FFmpegFormat &format);
 
 	void UpdateColorFormatSpaceWarning();
 
@@ -241,6 +258,7 @@ private:
 	void
 	LoadHotkeySettings(obs_hotkey_id ignoreKey = OBS_INVALID_HOTKEY_ID);
 	void LoadA11ySettings(bool presetChange = false);
+	void LoadAppearanceSettings(bool reload = false);
 	void LoadAdvancedSettings();
 	void LoadSettings(bool changedOnly);
 
@@ -250,26 +268,37 @@ private:
 
 	/* general */
 	void LoadLanguageList();
-	void LoadThemeList();
+	void LoadThemeList(bool firstLoad);
 	void LoadBranchesList();
 
 	/* stream */
 	void InitStreamPage();
 	inline bool IsCustomService() const;
+	inline bool IsWHIP() const;
 	void LoadServices(bool showAll);
 	void OnOAuthStreamKeyConnected();
 	void OnAuthConnected();
 	QString lastService;
+	QString protocol;
+	QString lastCustomServer;
 	int prevLangIndex;
 	bool prevBrowserAccel;
-private slots:
+
+	void ServiceChanged(bool resetFields = false);
+	QString FindProtocol();
 	void UpdateServerList();
 	void UpdateKeyLink();
 	void UpdateVodTrackSetting();
 	void UpdateServiceRecommendations();
-	void RecreateOutputResolutionWidget();
-	void UpdateResFPSLimits();
 	void UpdateMoreInfoLink();
+	void UpdateAdvNetworkGroup();
+
+	/* Appearance */
+	void InitAppearancePage();
+
+private slots:
+	void RecreateOutputResolutionWidget();
+	bool UpdateResFPSLimits();
 	void DisplayEnforceWarning(bool checked);
 	void on_show_clicked();
 	void on_authPwShow_clicked();
@@ -291,7 +320,7 @@ private:
 	void LoadAdvOutputRecordingEncoderProperties();
 	void LoadAdvOutputFFmpegSettings();
 	void LoadAdvOutputAudioSettings();
-	void SetAdvOutputFFmpegEnablement(ff_codec_type encoderType,
+	void SetAdvOutputFFmpegEnablement(FFmpegCodecType encoderType,
 					  bool enabled,
 					  bool enableEncode = false);
 
@@ -331,6 +360,7 @@ private:
 	void SaveVideoSettings();
 	void SaveHotkeySettings();
 	void SaveA11ySettings();
+	void SaveAppearanceSettings();
 	void SaveAdvancedSettings();
 	void SaveSettings();
 
@@ -347,7 +377,10 @@ private:
 
 	bool AskIfCanCloseSettings();
 
+	void UpdateYouTubeAppDockSettings();
+
 	QIcon generalIcon;
+	QIcon appearanceIcon;
 	QIcon streamIcon;
 	QIcon outputIcon;
 	QIcon audioIcon;
@@ -357,6 +390,7 @@ private:
 	QIcon advancedIcon;
 
 	QIcon GetGeneralIcon() const;
+	QIcon GetAppearanceIcon() const;
 	QIcon GetStreamIcon() const;
 	QIcon GetOutputIcon() const;
 	QIcon GetAudioIcon() const;
@@ -366,25 +400,32 @@ private:
 	QIcon GetAdvancedIcon() const;
 
 	int CurrentFLVTrack();
+	int SimpleOutGetSelectedAudioTracks();
+	int AdvOutGetSelectedAudioTracks();
+	int AdvOutGetStreamingSelectedAudioTracks();
 
 	OBSService GetStream1Service();
 
-	bool IsServiceOutputHasNetworkFeatures();
-
-	bool ServiceAndCodecCompatible();
+	bool ServiceAndVCodecCompatible();
+	bool ServiceAndACodecCompatible();
 	bool ServiceSupportsCodecCheck();
+
+	inline bool AllowsMultiTrack(const char *protocol);
+	void SwapMultiTrack(const char *protocol);
 
 private slots:
 	void on_theme_activated(int idx);
+	void on_themeVariant_activated(int idx);
 
 	void on_listWidget_itemSelectionChanged();
 	void on_buttonBox_clicked(QAbstractButton *button);
 
 	void on_service_currentIndexChanged(int idx);
+	void on_customServer_textChanged(const QString &text);
 	void on_simpleOutputBrowse_clicked();
 	void on_advOutRecPathBrowse_clicked();
 	void on_advOutFFPathBrowse_clicked();
-	void on_advOutEncoder_currentIndexChanged(int idx);
+	void on_advOutEncoder_currentIndexChanged();
 	void on_advOutRecEncoder_currentIndexChanged(int idx);
 	void on_advOutFFIgnoreCompat_stateChanged(int state);
 	void on_advOutFFFormat_currentIndexChanged(int idx);
@@ -425,22 +466,21 @@ private slots:
 	void Stream1Changed();
 	void VideoChanged();
 	void VideoChangedResolution();
-	void VideoChangedRestart();
 	void HotkeysChanged();
 	bool ScanDuplicateHotkeys(QFormLayout *layout);
 	void ReloadHotkeys(obs_hotkey_id ignoreKey = OBS_INVALID_HOTKEY_ID);
 	void A11yChanged();
+	void AppearanceChanged();
 	void AdvancedChanged();
 	void AdvancedChangedRestart();
 
 	void UpdateStreamDelayEstimate();
 
-	void UpdateAdvNetworkGroup();
-
 	void UpdateAutomaticReplayBufferCheckboxes();
 
 	void AdvOutSplitFileChanged();
 	void AdvOutRecCheckWarnings();
+	void AdvOutRecCheckCodecs();
 
 	void SimpleRecordingQualityChanged();
 	void SimpleRecordingEncoderChanged();
@@ -454,6 +494,7 @@ private slots:
 	OBSService SpawnTempService();
 
 	void SetGeneralIcon(const QIcon &icon);
+	void SetAppearanceIcon(const QIcon &icon);
 	void SetStreamIcon(const QIcon &icon);
 	void SetOutputIcon(const QIcon &icon);
 	void SetAudioIcon(const QIcon &icon);
@@ -464,8 +505,12 @@ private slots:
 
 	void UseStreamKeyAdvClicked();
 
+	void SimpleStreamAudioEncoderChanged();
+	void AdvAudioEncodersChanged();
+
 protected:
 	virtual void closeEvent(QCloseEvent *event) override;
+	virtual void showEvent(QShowEvent *event) override;
 	void reject() override;
 
 public:

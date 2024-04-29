@@ -1,5 +1,5 @@
 /******************************************************************************
-    Copyright (C) 2013 by Hugh Bailey <obs.jim@gmail.com>
+    Copyright (C) 2023 by Lain Bailey <lain@obsproject.com>
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,7 +20,7 @@
 
 #include "../util/threading.h"
 #include "../util/darray.h"
-#include "../util/circlebuf.h"
+#include "../util/deque.h"
 #include "../util/platform.h"
 #include "../util/profiler.h"
 #include "../util/util_uint64.h"
@@ -59,6 +59,7 @@ static inline void audio_input_free(struct audio_input *input)
 struct audio_mix {
 	DARRAY(struct audio_input) inputs;
 	float buffer[MAX_AUDIO_CHANNELS][AUDIO_OUTPUT_FRAMES];
+	float buffer_unclamped[MAX_AUDIO_CHANNELS][AUDIO_OUTPUT_FRAMES];
 };
 
 struct audio_output {
@@ -116,8 +117,12 @@ static inline void do_audio_output(struct audio_output *audio, size_t mix_idx,
 	for (size_t i = mix->inputs.num; i > 0; i--) {
 		struct audio_input *input = mix->inputs.array + (i - 1);
 
+		float(*buf)[AUDIO_OUTPUT_FRAMES] =
+			input->conversion.allow_clipping ? mix->buffer_unclamped
+							 : mix->buffer;
 		for (size_t i = 0; i < audio->planes; i++)
-			data.data[i] = (uint8_t *)mix->buffer[i];
+			data.data[i] = (uint8_t *)buf[i];
+
 		data.frames = frames;
 		data.timestamp = timestamp;
 
@@ -142,6 +147,8 @@ static inline void clamp_audio_output(struct audio_output *audio, size_t bytes)
 		for (size_t plane = 0; plane < audio->planes; plane++) {
 			float *mix_data = mix->buffer[plane];
 			float *mix_end = &mix_data[float_size];
+			/* Unclamped mix is copied directly. */
+			memcpy(mix->buffer_unclamped[plane], mix_data, bytes);
 
 			while (mix_data < mix_end) {
 				float val = *mix_data;
@@ -447,20 +454,20 @@ bool audio_output_active(const audio_t *audio)
 
 size_t audio_output_get_block_size(const audio_t *audio)
 {
-	return audio ? audio->block_size : 0;
+	return audio->block_size;
 }
 
 size_t audio_output_get_planes(const audio_t *audio)
 {
-	return audio ? audio->planes : 0;
+	return audio->planes;
 }
 
 size_t audio_output_get_channels(const audio_t *audio)
 {
-	return audio ? audio->channels : 0;
+	return audio->channels;
 }
 
 uint32_t audio_output_get_sample_rate(const audio_t *audio)
 {
-	return audio ? audio->info.samples_per_sec : 0;
+	return audio->info.samples_per_sec;
 }

@@ -273,6 +273,7 @@ static bool libfdk_encode(void *data, struct encoder_frame *frame,
 	packet->data = enc->packet_buffer;
 	packet->size = out_args.numOutBytes;
 	packet->type = OBS_ENCODER_AUDIO;
+	packet->keyframe = true;
 	packet->timebase_num = 1;
 	packet->timebase_den = enc->sample_rate;
 
@@ -305,7 +306,7 @@ static size_t libfdk_frame_size(void *data)
 struct obs_encoder_info obs_libfdk_encoder = {
 	.id = "libfdk_aac",
 	.type = OBS_ENCODER_AUDIO,
-	.codec = "AAC",
+	.codec = "aac",
 	.get_name = libfdk_getname,
 	.create = libfdk_create,
 	.destroy = libfdk_destroy,

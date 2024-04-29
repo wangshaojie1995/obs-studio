@@ -71,9 +71,6 @@
        <height>20</height>
       </size>
      </property>
-     <property name="shortcut">
-      <string>Space</string>
-     </property>
      <property name="flat">
       <bool>true</bool>
      </property>
@@ -298,14 +295,14 @@
  </widget>
  <customwidgets>
   <customwidget>
-   <class>MediaSlider</class>
-   <extends>QSlider</extends>
-   <header>media-slider.hpp</header>
-  </customwidget>
-  <customwidget>
    <class>ClickableLabel</class>
    <extends>QLabel</extends>
    <header>clickable-label.hpp</header>
+  </customwidget>
+  <customwidget>
+   <class>MediaSlider</class>
+   <extends>QSlider</extends>
+   <header>media-slider.hpp</header>
   </customwidget>
  </customwidgets>
  <resources>
