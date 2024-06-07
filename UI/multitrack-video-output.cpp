@@ -161,11 +161,21 @@ static OBSOutputAutoRelease create_output()
 
 static OBSOutputAutoRelease create_recording_output(obs_data_t *settings)
 {
-	OBSOutputAutoRelease output = obs_output_create(
-		"flv_output", "flv multitrack video", settings, nullptr);
+	OBSOutputAutoRelease output;
+	bool useMP4 = obs_data_get_bool(settings, "use_mp4");
 
-	if (!output)
-		blog(LOG_ERROR, "Failed to create multitrack video flv output");
+	if (useMP4) {
+		output = obs_output_create("mp4_output", "mp4 multitrack video",
+					   settings, nullptr);
+	} else {
+		output = obs_output_create("flv_output", "flv multitrack video",
+					   settings, nullptr);
+	}
+
+	if (!output) {
+		blog(LOG_ERROR, "Failed to create multitrack video %s output",
+		     useMP4 ? "mp4" : "flv");
+	}
 
 	return output;
 }
@@ -231,30 +241,16 @@ static void adjust_encoder_frame_rate_divisor(
 	obs_encoder_set_frame_rate_divisor(video_encoder, divisor);
 }
 
-static const std::vector<const char *> &get_available_encoders()
-{
-	// encoders are currently only registered during startup, so keeping
-	// a static vector around shouldn't be a problem
-	static std::vector<const char *> available_encoders = [] {
-		std::vector<const char *> available_encoders;
-		for (size_t i = 0;; i++) {
-			const char *id = nullptr;
-			if (!obs_enum_encoder_types(i, &id))
-				break;
-			available_encoders.push_back(id);
-		}
-		return available_encoders;
-	}();
-	return available_encoders;
-}
-
 static bool encoder_available(const char *type)
 {
-	auto &encoders = get_available_encoders();
-	return std::find_if(std::begin(encoders), std::end(encoders),
-			    [=](const char *encoder) {
-				    return strcmp(type, encoder) == 0;
-			    }) != std::end(encoders);
+	const char *id = nullptr;
+
+	for (size_t idx = 0; obs_enum_encoder_types(idx, &id); idx++) {
+		if (strcmp(id, type) == 0)
+			return true;
+	}
+
+	return false;
 }
 
 static OBSEncoderAutoRelease create_video_encoder(
