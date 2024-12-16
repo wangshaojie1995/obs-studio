@@ -68,6 +68,7 @@
 #include "window-youtube-actions.hpp"
 #include "youtube-api-wrappers.hpp"
 #endif
+#include "window-whats-new.hpp"
 #include "context-bar-controls.hpp"
 #include "obs-proxy-style.hpp"
 #include "display-helpers.hpp"
@@ -121,9 +122,14 @@ QCef *cef = nullptr;
 QCefCookieManager *panel_cookies = nullptr;
 bool cef_js_avail = false;
 
+extern std::string opt_starting_profile;
+extern std::string opt_starting_collection;
+
 void DestroyPanelCookieManager();
 
 namespace {
+
+QPointer<OBSWhatsNew> obsWhatsNew;
 
 template<typename OBSRef> struct SignalContainer {
 	OBSRef ref;
@@ -161,8 +167,6 @@ template<typename T> static void SetOBSRef(QListWidgetItem *item, T &&val)
 	item->setData(static_cast<int>(QtDataRole::OBSRef), QVariant::fromValue(val));
 }
 
-constexpr std::string_view OBSProfilePath = "/obs-studio/basic/profiles/";
-
 static void AddExtraModulePaths()
 {
 	string plugins_path, plugins_data_path;
@@ -177,10 +181,16 @@ static void AddExtraModulePaths()
 		plugins_data_path = s;
 
 	if (!plugins_path.empty() && !plugins_data_path.empty()) {
+#if defined(__APPLE__)
+		plugins_path += "/%module%.plugin/Contents/MacOS";
+		plugins_data_path += "/%module%.plugin/Contents/Resources";
+		obs_add_module_path(plugins_path.c_str(), plugins_data_path.c_str());
+#else
 		string data_path_with_module_suffix;
 		data_path_with_module_suffix += plugins_data_path;
 		data_path_with_module_suffix += "/%module%";
 		obs_add_module_path(plugins_path.c_str(), data_path_with_module_suffix.c_str());
+#endif
 	}
 
 	if (portable_mode)
@@ -1876,25 +1886,25 @@ bool OBSBasic::InitBasicConfig()
 
 	RefreshProfiles(true);
 
-	std::string currentProfileName{config_get_string(App()->GetUserConfig(), "Basic", "Profile")};
+	const std::string currentProfileName{config_get_string(App()->GetUserConfig(), "Basic", "Profile")};
+	const std::optional<OBSProfile> currentProfile = GetProfileByName(currentProfileName);
+	const std::optional<OBSProfile> foundProfile = GetProfileByName(opt_starting_profile);
 
-	auto foundProfile = GetProfileByName(currentProfileName);
-
-	if (!foundProfile) {
-		const OBSProfile &newProfile = CreateProfile(currentProfileName);
-
-		ActivateProfile(newProfile);
-	} else {
-		// TODO: Remove duplicate code from OBS initialization and just use ActivateProfile here instead
-		int code = activeConfiguration.Open(foundProfile.value().profileFile.u8string().c_str(),
-						    CONFIG_OPEN_ALWAYS);
-		if (code != CONFIG_SUCCESS) {
-			OBSErrorBox(NULL, "Failed to open basic.ini: %d", code);
-			return false;
+	try {
+		if (foundProfile) {
+			ActivateProfile(foundProfile.value());
+		} else if (currentProfile) {
+			ActivateProfile(currentProfile.value());
+		} else {
+			const OBSProfile &newProfile = CreateProfile(currentProfileName);
+			ActivateProfile(newProfile);
 		}
+	} catch (const std::logic_error &) {
+		OBSErrorBox(NULL, "Failed to open basic.ini: %d", -1);
+		return false;
 	}
 
-	return InitBasicConfigDefaults();
+	return true;
 }
 
 void OBSBasic::InitOBSCallbacks()
@@ -2119,9 +2129,7 @@ void OBSBasic::OBSInit()
 		emit VirtualCamEnabled();
 	}
 
-	InitBasicConfigDefaults2();
-
-	CheckForSimpleModeX264Fallback();
+	UpdateProfileEncoders();
 
 	LogEncoders();
 
@@ -2170,18 +2178,30 @@ void OBSBasic::OBSInit()
 
 	{
 		ProfileScope("OBSBasic::Load");
-		disableSaving--;
+		const std::string sceneCollectionName{
+			config_get_string(App()->GetUserConfig(), "Basic", "SceneCollection")};
+		const std::optional<OBSSceneCollection> configuredCollection =
+			GetSceneCollectionByName(sceneCollectionName);
+		const std::optional<OBSSceneCollection> foundCollection =
+			GetSceneCollectionByName(opt_starting_collection);
 
-		try {
-			const OBSSceneCollection &currentCollection = GetCurrentSceneCollection();
-			ActivateSceneCollection(currentCollection);
-		} catch (const std::invalid_argument &) {
-			const std::string collectionName =
-				config_get_string(App()->GetUserConfig(), "Basic", "SceneCollection");
-
-			SetupNewSceneCollection(collectionName);
+		if (foundCollection) {
+			ActivateSceneCollection(foundCollection.value());
+		} else if (configuredCollection) {
+			ActivateSceneCollection(configuredCollection.value());
+		} else {
+			disableSaving--;
+			SetupNewSceneCollection(sceneCollectionName);
+			disableSaving++;
 		}
 
+		disableSaving--;
+		if (foundCollection || configuredCollection) {
+			OnEvent(OBS_FRONTEND_EVENT_SCENE_COLLECTION_LIST_CHANGED);
+			OnEvent(OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED);
+		}
+		OnEvent(OBS_FRONTEND_EVENT_SCENE_CHANGED);
+		OnEvent(OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED);
 		disableSaving++;
 	}
 
@@ -2313,7 +2333,7 @@ void OBSBasic::OBSInit()
 	disableColorSpaceConversion(this);
 #endif
 
-	bool has_last_version = config_has_user_value(App()->GetUserConfig(), "General", "LastVersion");
+	bool has_last_version = config_has_user_value(App()->GetAppConfig(), "General", "LastVersion");
 	bool first_run = config_get_bool(App()->GetUserConfig(), "General", "FirstRun");
 
 	if (!first_run) {
@@ -2326,10 +2346,10 @@ void OBSBasic::OBSInit()
 
 #if (defined(_WIN32) || defined(__APPLE__)) && (OBS_RELEASE_CANDIDATE > 0 || OBS_BETA > 0)
 	/* Automatically set branch to "beta" the first time a pre-release build is run. */
-	if (!config_get_bool(App()->GetUserConfig(), "General", "AutoBetaOptIn")) {
-		config_set_string(App()->GetUserConfig(), "General", "UpdateBranch", "beta");
-		config_set_bool(App()->GetUserConfig(), "General", "AutoBetaOptIn", true);
-		config_save_safe(App()->GetUserConfig(), "tmp", nullptr);
+	if (!config_get_bool(App()->GetAppConfig(), "General", "AutoBetaOptIn")) {
+		config_set_string(App()->GetAppConfig(), "General", "UpdateBranch", "beta");
+		config_set_bool(App()->GetAppConfig(), "General", "AutoBetaOptIn", true);
+		config_save_safe(App()->GetAppConfig(), "tmp", nullptr);
 	}
 #endif
 	TimedCheckForUpdates();
@@ -2538,37 +2558,11 @@ void OBSBasic::ShowWhatsNew(const QString &url)
 	if (closing)
 		return;
 
-	std::string info_url = QT_TO_UTF8(url);
-
-	QDialog *dlg = new QDialog(this);
-	dlg->setAttribute(Qt::WA_DeleteOnClose, true);
-	dlg->setWindowTitle("What's New");
-	dlg->resize(700, 600);
-
-	Qt::WindowFlags flags = dlg->windowFlags();
-	Qt::WindowFlags helpFlag = Qt::WindowContextHelpButtonHint;
-	dlg->setWindowFlags(flags & (~helpFlag));
-
-	QCefWidget *cefWidget = cef->create_widget(nullptr, info_url);
-	if (!cefWidget) {
-		return;
+	if (obsWhatsNew) {
+		obsWhatsNew->close();
 	}
 
-	connect(cefWidget, &QCefWidget::titleChanged, dlg, &QDialog::setWindowTitle);
-
-	QPushButton *close = new QPushButton(QTStr("Close"));
-	connect(close, &QAbstractButton::clicked, dlg, &QDialog::accept);
-
-	QHBoxLayout *bottomLayout = new QHBoxLayout();
-	bottomLayout->addStretch();
-	bottomLayout->addWidget(close);
-	bottomLayout->addStretch();
-
-	QVBoxLayout *topLayout = new QVBoxLayout(dlg);
-	topLayout->addWidget(cefWidget);
-	topLayout->addLayout(bottomLayout);
-
-	dlg->show();
+	obsWhatsNew = new OBSWhatsNew(this, QT_TO_UTF8(url));
 #else
 	UNUSED_PARAMETER(url);
 #endif
@@ -3825,7 +3819,7 @@ void OBSBasic::TimedCheckForUpdates()
 {
 	if (App()->IsUpdaterDisabled())
 		return;
-	if (!config_get_bool(App()->GetUserConfig(), "General", "EnableAutoUpdates"))
+	if (!config_get_bool(App()->GetAppConfig(), "General", "EnableAutoUpdates"))
 		return;
 
 #if defined(ENABLE_SPARKLE_UPDATER)
@@ -7635,13 +7629,14 @@ void OBSBasic::on_actionShowSettingsFolder_triggered()
 
 void OBSBasic::on_actionShowProfileFolder_triggered()
 {
-	std::string userProfilePath;
-	userProfilePath.reserve(App()->userProfilesLocation.u8string().size() + OBSProfilePath.size());
-	userProfilePath.append(App()->userProfilesLocation.u8string()).append(OBSProfilePath);
+	try {
+		const OBSProfile &currentProfile = GetCurrentProfile();
+		QString currentProfileLocation = QString::fromStdString(currentProfile.path.u8string());
 
-	const QString userProfileLocation = QString::fromStdString(userProfilePath);
-
-	QDesktopServices::openUrl(QUrl::fromLocalFile(userProfileLocation));
+		QDesktopServices::openUrl(QUrl::fromLocalFile(currentProfileLocation));
+	} catch (const std::invalid_argument &error) {
+		blog(LOG_ERROR, "%s", error.what());
+	}
 }
 
 int OBSBasic::GetTopSelectedSourceItem()
